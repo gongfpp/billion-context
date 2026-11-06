@@ -64,6 +64,7 @@ import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "..
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -2304,10 +2305,7 @@ export function apply(ctx: PluginContext): void {
         // now decode content-encoded bodies, so this arm settles async — the
         // gate contract already tolerates Promise verdicts (threw arm).
         if (attr.state === "none") {
-            // #4829 review: without init there is no body to decode and the
-            // claim can never succeed — settle synchronously so this shape
-            // keeps the OLD verdict class: native-ws-intercept.ts compares
-            // its gate result with === false WITHOUT awaiting.
+            // Without init there is no body to decode or recall.
             if (init === undefined) {
                 threwStreak = 0;
                 threwGiveUpNoticed = false;
@@ -2793,9 +2791,11 @@ export function apply(ctx: PluginContext): void {
         handler: (invocation) => cacheOutcome(ctx, invocation),
     });
 
-    // node:test drives apply() directly with a mock ctx — never patch
-    // globalThis.fetch from inside a test run.
-    if (process.env.NODE_TEST_CONTEXT === undefined) installNativeFetchIntercept(state);
+    // Tests install their own isolated transport wrappers.
+    if (process.env.NODE_TEST_CONTEXT === undefined) {
+        installNativeFetchIntercept(state);
+        installNativeWebSocketIntercept(state);
+    }
 }
 
 /** Test hook: reset the module-level registration lifecycle so suites can

@@ -21,10 +21,10 @@
 //     upstream transport turns the embedded URL back with
 //     `url.replace(/^http/, "ws")` — a naive `${origin}/bili/${wssUrl}` is
 //     unclaimed and 426s;
-//   * forwards constructor arguments VERBATIM (subprotocols, the `{headers}`
-//     init object carrying session-id + x-bili-plugin* stamped by pi's
-//     before_provider_headers — verified to ride the upgrade request on Node
-//     ≥22 undici and Bun, #2073 Q1);
+//   * preserves Pi's already-stamped constructor arguments; DSH's two-argument
+//     `{headers}` path instead awaits tools and stamps authoritative identity,
+//     then prepares every response.create in the sender's dispatch scope (#5838);
+//     cached sockets refuse changed activation, origin, or upgrade metadata;
 //   * leaves everything else alone: non-model WS (devtools, socket.io, …),
 //     already-/bili/-routed URLs, control-plane paths, other protocols.
 //
@@ -136,6 +136,76 @@ export function rewriteCodexResponsesWsUrl(target: string, origin: string): stri
     return `${proxyWs}/bili/${target}`;
 }
 
+function withIdentityHeaders(rest: unknown[], extra: Record<string, string>): unknown[] {
+    const index = typeof rest[0] === "string" || Array.isArray(rest[0]) || (rest[0] === undefined && rest.length > 1) ? 1 : 0;
+    const options = rest[index] as { headers?: RequestInit["headers"] } | undefined;
+    const headers = new Headers(options?.headers);
+    for (const [key, value] of Object.entries(extra)) headers.set(key, value);
+    const result = [...rest];
+    result[index] = { ...options, headers: Object.fromEntries(headers) };
+    return result;
+}
+
+async function waitForWsTools(state: NativeInterceptState): Promise<void> {
+    if (state.toolsReady === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        await Promise.race([
+            state.toolsReady,
+            new Promise<void>(resolve => { timer = setTimeout(resolve, state.readyTimeoutMs ?? 15_000); }),
+        ]);
+    } finally {
+        if (timer !== undefined) clearTimeout(timer);
+    }
+}
+
+function prepareWsFrames(socket: WsInstanceLike, target: string, state: NativeInterceptState, identity: Record<string, string> | undefined, origin: NativeInterceptState["wsOrigin"], generation: unknown): WsInstanceLike {
+    if (state.beforeSend === undefined) return socket;
+    const assertCurrent = (): void => {
+        if ((globalThis as GlobalRecord)[ACTIVE_STATE] !== state || (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ] !== generation || (state.wsOrigin ?? state.origin) !== origin) {
+            throw new Error("bili-native(ws): plugin state/origin changed; reconnect before sending");
+        }
+    };
+    const send = socket.send.bind(socket);
+    let pending = Promise.resolve();
+    let failed = false;
+    socket.send = (data: unknown): void => {
+        if (socket.readyState !== 1) return send(data);
+        let frame: unknown;
+        if (typeof data === "string") {
+            try { frame = JSON.parse(data); } catch { /* Preserve malformed/control frames. */ }
+        }
+        const isCreate = frame !== null && typeof frame === "object" && (frame as { type?: unknown }).type === "response.create";
+        // Register each continuation in the SENDER's ALS scope, not the upgrade's.
+        pending = pending.then(async () => {
+            if (failed || socket.readyState !== 1) return;
+            assertCurrent();
+            if (!isCreate || typeof data !== "string") return send(data);
+            await waitForWsTools(state);
+            const init: RequestInit = { body: data, headers: identity === undefined ? undefined : { ...identity } };
+            const verdict = await state.takeoverGate?.(target, { bytes: Buffer.byteLength(data) }, init);
+            if (verdict !== undefined && verdict !== true) throw new Error("bili-native(ws): request attribution refused on a reused connection");
+            await state.beforeSend?.(target, init);
+            assertCurrent();
+            const current = state.headersFor?.(target);
+            const prepared = Object.fromEntries(new Headers(init.headers));
+            const keys = new Set([...Object.keys(identity ?? {}), ...Object.keys(current ?? {}), ...Object.keys(prepared)]);
+            if ([...keys].some(key => identity?.[key] !== current?.[key] || identity?.[key] !== prepared[key])) {
+                throw new Error("bili-native(ws): request identity/model changed; reconnect before sending");
+            }
+            send(init.body ?? data);
+        }).catch((error: unknown) => {
+            if (failed) return;
+            failed = true;
+            const event = new Event("error");
+            Object.assign(event, { error });
+            socket.dispatchEvent(event);
+            socket.close(1008, "bili request preparation refused");
+        });
+    };
+    return socket;
+}
+
 /** Deferred-connection shell: stands in for the real WebSocket while the
  *  proxy origin is still settling. Listeners/on*-handlers/binaryType recorded
  *  during the window are replayed onto the real instance at attach; accessors
@@ -147,6 +217,7 @@ export function rewriteCodexResponsesWsUrl(target: string, origin: string): stri
 class DeferredWebSocket {
     private real: WsInstanceLike | undefined;
     private cancelled = false;
+    private closed = false;
     private settled = false;
     private listeners = new Map<string, Array<{ el: EventListener | EventListenerObject; once: boolean }>>();
     private handlers: Partial<Record<"onopen" | "onerror" | "onclose" | "onmessage", EventListener | null>> = {};
@@ -164,18 +235,15 @@ class DeferredWebSocket {
     private async settle(rest: unknown[]): Promise<void> {
         if (this.settled) return;
         this.settled = true;
-        let finalUrl: string | undefined;
         try {
-            finalUrl = await this.resolveFinalUrl();
-        } catch {
-            finalUrl = undefined;
-        }
-        // Re-check AFTER the await: a close() may have landed mid-window.
-        if (this.cancelled || this.real !== undefined) return;
-        try {
+            const finalUrl = await this.resolveFinalUrl();
+            // A failed preparation must not silently bypass the takeover gate.
+            if (this.cancelled || this.real !== undefined) return;
             this.attach(this.construct(finalUrl ?? this.requestedUrl, rest));
         } catch (error) {
-            // constructLive exhausted every candidate: surface a socket error +
+            if (this.cancelled) return;
+            this.closed = true;
+            // Preparation/constructLive failed: surface a socket error +
             // abnormal close so client cleanup proceeds, instead of letting the
             // rejected promise become an unhandledRejection in the host process.
             const errEvent = new Event("error");
@@ -264,7 +332,7 @@ class DeferredWebSocket {
     }
 
     get readyState(): number {
-        return this.real?.readyState ?? (this.cancelled ? CLOSING : CONNECTING);
+        return this.real?.readyState ?? (this.closed ? 3 : this.cancelled ? CLOSING : CONNECTING);
     }
 
     get url(): string {
@@ -409,9 +477,56 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
             // plugin → pass through direct, never hit a disposed context.
             const state = (globalThis as GlobalRecord)[ACTIVE_STATE] as NativeInterceptState | undefined;
             if (target === undefined || state === undefined) return new RoutedWebSocket(url, ...rest);
-            if (state.takeoverGate !== undefined && state.takeoverGate(target) === false) {
+            const verdict = state.takeoverGate?.(target);
+            if (verdict === false) {
                 state.onDispatch?.(target, "refused");
                 return new RoutedWebSocket(url, ...rest);
+            }
+            if (state.headersFor !== undefined || state.beforeSend !== undefined || state.toolsReady !== undefined || (verdict !== undefined && verdict !== true)) {
+                const generation = (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ];
+                const assertCurrent = (): void => {
+                    if ((globalThis as GlobalRecord)[ACTIVE_STATE] !== state || (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ] !== generation) {
+                        throw new Error("bili-native(ws): plugin activation changed during connection preparation");
+                    }
+                };
+                let preparedRest = rest;
+                let identity: Record<string, string> | undefined;
+                let originBinding: NativeInterceptState["wsOrigin"];
+                let claimed = false;
+                return new DeferredWebSocket(urlStr, rest, async () => {
+                    const settledVerdict = await verdict;
+                    assertCurrent();
+                    if (settledVerdict === false) {
+                        state.onDispatch?.(target, "refused");
+                        return urlStr;
+                    }
+                    if (settledVerdict !== undefined && settledVerdict !== true) {
+                        state.onDispatch?.(target, "refused");
+                        throw new Error(`bili-native(ws): ${settledVerdict}`);
+                    }
+                    await waitForWsTools(state);
+                    const origin = state.wsOrigin ?? state.origin;
+                    const settled = typeof origin === "string" ? origin : state.wsOrigin instanceof Promise ? await raceWsOriginBound(state.wsOrigin) : await readyOrigin(state);
+                    assertCurrent();
+                    if (settled === undefined) {
+                        state.onDispatch?.(target, "direct");
+                        return undefined;
+                    }
+                    const headers = state.headersFor?.(target);
+                    identity = headers === undefined ? undefined : { ...headers };
+                    if (identity !== undefined) preparedRest = withIdentityHeaders(rest, identity);
+                    claimed = true;
+                    originBinding = state.wsOrigin ?? state.origin;
+                    const rewritten = rewriteCodexResponsesWsUrl(target, settled);
+                    noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
+                    state.onDispatch?.(rewritten, "rewrite");
+                    return rewritten;
+                }, finalUrl => {
+                    assertCurrent();
+                    if (claimed && (state.wsOrigin ?? state.origin) !== originBinding) throw new Error("bili-native(ws): proxy origin changed during connection preparation");
+                    const socket = constructLive(finalUrl, preparedRest);
+                    return claimed ? prepareWsFrames(socket, target, state, identity, originBinding, generation) : socket;
+                });
             }
             const rewrite = (origin: string): unknown => {
                 const rewritten = rewriteCodexResponsesWsUrl(target, origin);
