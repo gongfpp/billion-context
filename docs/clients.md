@@ -61,7 +61,11 @@ Two lanes, same plugin (#941):
   and nothing compresses until the context limit. On such builds set
   `providers.openai-codex.transport` to `sse` (hot settings) so the traffic
   rides the fetch leg; from the fix release onward the WebSocket leg is
-  intercepted and header-stamped automatically.
+  intercepted and header-stamped automatically. A cached socket re-checks
+  session/model identity, plugin activation and proxy origin before every
+  `response.create` and refuses to send once any of them changed — the host
+  reconnects (or falls back to SSE) instead of reusing stale upgrade
+  metadata.
 - **Boundary — third-party Codex transports:** plugins that build their OWN
   Codex WebSocket client bypass bili's intercepts by construction. Example
   found in the wild 2026-11-08: `dsh-codex-subscription` with
